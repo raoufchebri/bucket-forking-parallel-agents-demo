@@ -1,103 +1,415 @@
-import Image from "next/image";
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { nanoid } from "nanoid";
+
+import { Item } from "./components/Item";
+
+const MIN_SCALE = 0.25;
+const MAX_SCALE = 4;
+const ZOOM_SENSITIVITY = 0.0015;
+const GRID_BASE_SIZE = 32;
+const ITEM_SIZE = 160;
+const HALF_ITEM_SIZE = ITEM_SIZE / 2;
+const CHILD_OFFSET_X = ITEM_SIZE + 120;
+const CHILD_VERTICAL_GAP = ITEM_SIZE + 40;
+
+type Point = {
+  x: number;
+  y: number;
+};
+
+type CanvasState = {
+  scale: number;
+  translation: Point;
+};
+
+type CanvasItem = {
+  id: string;
+  label: string;
+  imageUrl?: string;
+  position: Point;
+  parentId?: string;
+  isLoading?: boolean;
+};
+
+type Connection = {
+  id: string;
+  from: string;
+  to: string;
+};
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
 
 export default function Home() {
   return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+    <main className="w-screen h-screen">
+      <InfiniteCanvas />
+    </main>
+  );
+}
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
+function InfiniteCanvas() {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [state, setState] = useState<CanvasState>({
+    scale: 1,
+    translation: { x: 0, y: 0 },
+  });
+  const [items, setItems] = useState<CanvasItem[]>([]);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const pointerRef = useRef<{
+    pointerId: number;
+    lastPosition: Point;
+  } | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
+  const isInitialisedRef = useRef(false);
+
+  const applyPan = useCallback((delta: Point) => {
+    setState((prev) => ({
+      ...prev,
+      translation: {
+        x: prev.translation.x + delta.x,
+        y: prev.translation.y + delta.y,
+      },
+    }));
+  }, []);
+
+  const applyZoom = useCallback(
+    (zoomDelta: number, anchor: Point) => {
+      setState((prev) => {
+        const nextScale = clamp(
+          prev.scale * Math.exp(-zoomDelta * ZOOM_SENSITIVITY),
+          MIN_SCALE,
+          MAX_SCALE,
+        );
+
+        if (!containerRef.current) {
+          return { ...prev, scale: nextScale };
+        }
+
+        const rect = containerRef.current.getBoundingClientRect();
+        const offset = {
+          x: anchor.x - rect.left,
+          y: anchor.y - rect.top,
+        };
+
+        const scaleRatio = nextScale / prev.scale;
+        const nextTranslation = {
+          x: offset.x - (offset.x - prev.translation.x) * scaleRatio,
+          y: offset.y - (offset.y - prev.translation.y) * scaleRatio,
+        };
+
+        return {
+          scale: nextScale,
+          translation: nextTranslation,
+        };
+      });
+    },
+    [],
+  );
+
+  const handlePointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pointerRef.current = {
+      pointerId: event.pointerId,
+      lastPosition: { x: event.clientX, y: event.clientY },
+    };
+    setIsPanning(true);
+  }, []);
+
+  const handlePointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!pointerRef.current || pointerRef.current.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const { lastPosition } = pointerRef.current;
+    const delta = {
+      x: event.clientX - lastPosition.x,
+      y: event.clientY - lastPosition.y,
+    };
+
+    pointerRef.current = {
+      pointerId: event.pointerId,
+      lastPosition: { x: event.clientX, y: event.clientY },
+    };
+
+    applyPan(delta);
+  }, [applyPan]);
+
+  const endPan = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (pointerRef.current && pointerRef.current.pointerId === event.pointerId) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+      pointerRef.current = null;
+      setIsPanning(false);
+    }
+  }, []);
+
+  const handleWheel = useCallback(
+    (event: React.WheelEvent<HTMLDivElement>) => {
+      event.preventDefault();
+
+      applyZoom(event.deltaY, { x: event.clientX, y: event.clientY });
+    },
+    [applyZoom],
+  );
+
+  const classes = useMemo(() => {
+    const base = "canvas-container";
+    return isPanning ? `${base} is-panning` : base;
+  }, [isPanning]);
+
+  const contentStyle = useMemo(() => {
+    const { translation, scale } = state;
+    return {
+      transform: `translate(${translation.x}px, ${translation.y}px) scale(${scale})`,
+    };
+  }, [state]);
+
+  const gridStyle = useMemo(() => {
+    const { translation, scale } = state;
+    const size = GRID_BASE_SIZE * scale;
+    const offsetX = translation.x % size;
+    const offsetY = translation.y % size;
+    return {
+      backgroundSize: `${size}px ${size}px`,
+      backgroundPosition: `${offsetX}px ${offsetY}px`,
+    };
+  }, [state]);
+
+  const createChildItem = useCallback(
+    async (parent: CanvasItem) => {
+      const childId = nanoid();
+      const child: CanvasItem = {
+        id: childId,
+        label: "Item",
+        position: parent.position,
+        parentId: parent.id,
+        isLoading: true,
+      };
+
+      // Create the item with loading state immediately
+      setItems((prev) => {
+        const siblings = prev.filter((item) => item.parentId === parent.id);
+        const updatedSiblings = [...siblings, child];
+
+        const startY =
+          parent.position.y - ((updatedSiblings.length - 1) * CHILD_VERTICAL_GAP) / 2;
+
+        const positionedChildren = updatedSiblings.map((sibling, index) => ({
+          id: sibling.id,
+          position: {
+            x: parent.position.x + CHILD_OFFSET_X,
+            y: startY + index * CHILD_VERTICAL_GAP,
+          },
+        }));
+
+        const positionMap = new Map<string, Point>();
+        positionedChildren.forEach(({ id, position }) => {
+          positionMap.set(id, position);
+        });
+
+        const nextItems = prev.map((item) => {
+          if (item.parentId !== parent.id) {
+            return item;
+          }
+
+          const nextPosition = positionMap.get(item.id);
+
+          if (!nextPosition) {
+            return item;
+          }
+
+          return {
+            ...item,
+            position: nextPosition,
+          };
+        });
+
+        const newChildPosition = positionMap.get(child.id);
+
+        if (newChildPosition) {
+          nextItems.push({
+            ...child,
+            position: newChildPosition,
+          });
+        }
+
+        return nextItems;
+      });
+
+      setConnections((prev) => [
+        ...prev,
+        { id: nanoid(), from: parent.id, to: childId },
+      ]);
+
+      // Load the image in the background
+      try {
+        const response = await fetch("/api/agent");
+
+        if (!response.ok) {
+          console.error("Failed to fetch image from agent API");
+          return;
+        }
+
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+
+        // Update the item with the loaded image
+        setItems((prev) =>
+          prev.map((item) =>
+            item.id === childId
+              ? { ...item, imageUrl: objectUrl, isLoading: false }
+              : item
+          )
+        );
+      } catch (error) {
+        console.error("Error loading image:", error);
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!containerRef.current || isInitialisedRef.current) {
+      return;
+    }
+
+    const rect = containerRef.current.getBoundingClientRect();
+    const centerTranslation = {
+      x: rect.width / 2 - HALF_ITEM_SIZE,
+      y: rect.height / 2 - HALF_ITEM_SIZE,
+    };
+
+    setState((prev) => ({
+      ...prev,
+      translation: centerTranslation,
+    }));
+
+    isInitialisedRef.current = true;
+  }, []);
+
+  // Load the origin image from the API
+  useEffect(() => {
+    const originId = nanoid();
+    
+    // Create the origin item with loading state immediately
+    setItems([
+      {
+        id: originId,
+        label: "Origin",
+        position: { x: 0, y: 0 },
+        isLoading: true,
+      },
+    ]);
+
+    async function loadOriginImage() {
+      try {
+        const response = await fetch("/api/get-image");
+        
+        if (!response.ok) {
+          console.error("Failed to fetch origin image from Tigris storage");
+          return;
+        }
+
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+
+        // Update the origin item with the loaded image
+        setItems((prev) =>
+          prev.map((item) =>
+            item.id === originId
+              ? { ...item, imageUrl: objectUrl, isLoading: false }
+              : item
+          )
+        );
+      } catch (error) {
+        console.error("Error loading origin image:", error);
+      }
+    }
+
+    loadOriginImage();
+  }, []);
+
+  const handleItemClick = useCallback(
+    (id: string) => {
+      const parent = items.find((item) => item.id === id);
+
+      if (!parent) {
+        return;
+      }
+
+      createChildItem(parent);
+    },
+    [createChildItem, items],
+  );
+
+  const renderedConnections = useMemo(() => {
+    const idToItem = new Map(items.map((item) => [item.id, item]));
+
+    return connections
+      .map((connection) => {
+        const from = idToItem.get(connection.from);
+        const to = idToItem.get(connection.to);
+
+        if (!from || !to) {
+          return null;
+        }
+
+        const start = from.position;
+        const end = to.position;
+
+        const dx = end.x - start.x;
+        const dy = end.y - start.y;
+        const length = Math.sqrt(dx * dx + dy * dy);
+        const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+
+        return (
+          <div
+            key={connection.id}
+            className="canvas-connection"
+            style={{
+              width: `${length}px`,
+              transform: `translate(${start.x + HALF_ITEM_SIZE}px, ${start.y + HALF_ITEM_SIZE}px) rotate(${angle}deg)`,
+            }}
+          />
+        );
+      })
+      .filter(Boolean);
+  }, [connections, items]);
+
+  return (
+    <div
+      ref={containerRef}
+      className={classes}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={endPan}
+      onPointerCancel={endPan}
+      onWheel={handleWheel}
+    >
+      <div className="canvas-layer">
+        <div className="canvas-surface canvas-grid" style={gridStyle} />
+        <div className="canvas-surface canvas-content" style={contentStyle}>
+          {renderedConnections}
+          {items.map((item) => (
+            <Item
+              key={item.id}
+              id={item.id}
+              label={item.label}
+              imageUrl={item.imageUrl}
+              position={item.position}
+              onClick={handleItemClick}
+              isLoading={item.isLoading}
             />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+          ))}
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+      </div>
     </div>
   );
 }
