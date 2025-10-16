@@ -1,13 +1,19 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenAI } from '@google/genai';
+import { createBucket, get, put } from "@tigrisdata/storage";
+import { nanoid } from "nanoid";
 
-async function generateImagePrompt(ai: GoogleGenAI): Promise<string> {
+async function generateImageEditPrompt(
+  ai: GoogleGenAI,
+  imageBase64: string,
+  mimeType: string
+): Promise<string> {
   const promptGenerationModel = 'gemini-2.0-flash-exp';
-  
+
   // Add variety by randomly selecting a theme/category
   const themes = [
     "nature and landscapes",
-    "urban and architecture", 
+    "urban and architecture",
     "abstract and geometric",
     "surreal and dreamlike",
     "minimalist and clean",
@@ -22,7 +28,7 @@ async function generateImagePrompt(ai: GoogleGenAI): Promise<string> {
     "mystical and spiritual",
     "seasonal scenes",
   ];
-  
+
   const styles = [
     "photorealistic",
     "painterly",
@@ -35,48 +41,38 @@ async function generateImagePrompt(ai: GoogleGenAI): Promise<string> {
     "cinematic",
     "atmospheric",
   ];
-  
+
   const randomTheme = themes[Math.floor(Math.random() * themes.length)];
   const randomStyle = styles[Math.floor(Math.random() * styles.length)];
   const randomSeed = Math.floor(Math.random() * 10000);
-  
-  const systemPrompt = `Generate a single creative and detailed image prompt with these constraints:
-- Theme: ${randomTheme}
+
+  const instruction = `Given the provided image, propose a single concise edit instruction (1-2 sentences) that creatively transforms the image.
+- Randomized theme: ${randomTheme}
 - Visual style: ${randomStyle}
 - Seed: ${randomSeed}
 
-Include specific details about:
-- Subject/scene
-- Mood and atmosphere
-- Colors and lighting
-- Composition or perspective
-
-Keep it concise (1-2 sentences max). Be creative and original.
-Output ONLY the image prompt, nothing else.`;
+Focus on edit guidance (what to change/add/transform), not describing the current image. Output only the edit instruction.`;
 
   const response = await ai.models.generateContent({
     model: promptGenerationModel,
-    config: {
-      temperature: 0.1,
-    },
+    config: { temperature: 0.1 },
     contents: [
       {
         role: 'user',
         parts: [
-          {
-            text: systemPrompt,
-          },
+          { inlineData: { mimeType, data: imageBase64 } },
+          { text: instruction },
         ],
       },
     ],
   });
 
-  const generatedPrompt = response.text?.trim() || "A beautiful abstract composition with vibrant colors";
-  console.log("Generated prompt:", generatedPrompt);
+  const generatedPrompt = response.text?.trim() || "Apply a creative color grading and lighting shift to evoke a cinematic, atmospheric mood.";
+  console.log("Generated edit prompt:", generatedPrompt);
   return generatedPrompt;
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     
@@ -88,25 +84,75 @@ export async function GET() {
       apiKey,
     });
 
-    // First, generate a creative prompt using LLM
-    const prompt = await generateImagePrompt(ai);
+    // Determine source bucket/file from query and fork a new bucket
+    const url = new URL(req.url);
+    const sourceBucketName = url.searchParams.get('bucketName') || 'bucket-with-snapshots';
+    const sourceFileName = url.searchParams.get('fileName') || 'original_image.png';
+
+    // Generate a bucket name that matches allowed charset: lowercase letters, numbers, dots, hyphens
+    const suffix = Math.random().toString(36).slice(2, 10); // a-z0-9
+    const forkBucketName = `forked-bucket-${suffix}`;
+    const forkResult = await createBucket(forkBucketName, { sourceBucketName });
+
+    if ((forkResult as any)?.error) {
+      console.error('Error creating bucket fork:', (forkResult as any).error);
+      return new NextResponse(`Failed to create bucket fork: ${(forkResult as any).error}`, { status: 500 });
+    }
+
+    // Load the original image from forked bucket
+    const getResult = await get(sourceFileName, 'file', {
+      config: { bucket: forkBucketName },
+    });
+
+    if (getResult.error) {
+      console.error('Error getting image from Tigris:', getResult.error);
+      return new NextResponse(`Failed to fetch image: ${getResult.error}`, { status: 500 });
+    }
+
+    if (!getResult.data) {
+      return new NextResponse('Image not found', { status: 404 });
+    }
+
+    const arrayBuffer = await getResult.data.arrayBuffer();
+    const originalImageBuffer = Buffer.from(arrayBuffer);
+    // Normalize mime type: prefer file extension, treat any octet-stream variants as invalid
+    const detectedType = (getResult.data.type || '').toLowerCase();
+    const fileExt = (sourceFileName.split('?')[0] || '').toLowerCase().split('.').pop() || '';
+    const extToMime: Record<string, string> = {
+      png: 'image/png',
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      webp: 'image/webp',
+      gif: 'image/gif',
+      bmp: 'image/bmp',
+      tif: 'image/tiff',
+      tiff: 'image/tiff',
+    };
+    let originalImageMime = extToMime[fileExt] || detectedType || 'image/png';
+    if (originalImageMime.includes('octet-stream')) {
+      originalImageMime = extToMime[fileExt] || 'image/png';
+    }
+    const originalImageBase64 = originalImageBuffer.toString('base64');
+
+    // Generate an edit prompt conditioned on the original image
+    const prompt = await generateImageEditPrompt(ai, originalImageBase64, originalImageMime);
 
     const config = {
       responseModalities: ['IMAGE', 'TEXT'],
     };
 
     const imageModel = 'gemini-2.5-flash-image-preview';
-    
+
     const contents = [
       {
         role: 'user',
         parts: [
-          {
-            text: prompt,
-          },
+          { inlineData: { mimeType: originalImageMime, data: originalImageBase64 } },
+          { text: prompt },
         ],
       },
     ];
+    // We'll upload generated image back into the forked bucket
 
     const response = await ai.models.generateContentStream({
       model: imageModel,
@@ -125,10 +171,33 @@ export async function GET() {
         const buffer = Buffer.from(inlineData.data || '', 'base64');
         const mimeType = inlineData.mimeType || 'image/png';
 
+        // Upload generated image to Tigris
+        const ext = mimeType === 'image/jpeg' ? 'jpg' : (mimeType.split('/')[1] || 'png');
+        const objectKey = `generated/${nanoid()}.${ext}`;
+        const bucketToUse = forkBucketName;
+
+        try {
+          const blob = new Blob([buffer], { type: mimeType });
+          const putResult = await put(objectKey, blob, {
+            contentType: mimeType,
+            config: { bucket: bucketToUse },
+          });
+
+          if (putResult?.error) {
+            console.error('Error uploading generated image to Tigris:', putResult.error);
+          } else {
+            console.log('Uploaded generated image to Tigris:', objectKey);
+          }
+        } catch (e) {
+          console.error('Unexpected error uploading image:', e);
+        }
+
         return new NextResponse(buffer, {
           headers: {
             "content-type": mimeType,
             "cache-control": "no-store",
+            "x-bucket-name": bucketToUse,
+            "x-file-name": objectKey,
           },
         });
       }
@@ -142,3 +211,16 @@ export async function GET() {
   }
 }
 
+const createdBucketFork = async (bucketName: string) => {
+
+  const result = await createBucket(bucketName, {
+    sourceBucketName: "bucket-with-snapshots"
+  });
+
+  if (result.error) {
+    console.error("error creating bucket fork", result.error);
+  } else {
+    console.log("bucket fork created", result);
+  }
+
+}

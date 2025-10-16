@@ -31,6 +31,9 @@ type CanvasItem = {
   position: Point;
   parentId?: string;
   isLoading?: boolean;
+  bucketName?: string;
+  fileName?: string;
+  isGenerating?: boolean;
 };
 
 type Connection = {
@@ -59,6 +62,9 @@ function InfiniteCanvas() {
   });
   const [items, setItems] = useState<CanvasItem[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [forkOnAdd, setForkOnAdd] = useState(false);
+  const [listVersion, setListVersion] = useState(0);
+  const anyGenerating = useMemo(() => items.some((i) => i.isGenerating), [items]);
   const pointerRef = useRef<{
     pointerId: number;
     lastPosition: Point;
@@ -248,9 +254,30 @@ function InfiniteCanvas() {
         { id: nanoid(), from: parent.id, to: childId },
       ]);
 
-      // Load the image in the background
+      // If forking is disabled, just clone parent's image/metadata
+      if (!forkOnAdd) {
+        setItems((prev) =>
+          prev.map((item) =>
+            item.id === childId
+              ? {
+                  ...item,
+                  imageUrl: parent.imageUrl,
+                  isLoading: false,
+                  bucketName: parent.bucketName,
+                  fileName: parent.fileName,
+                }
+              : item,
+          ),
+        );
+        return;
+      }
+
+      // Fork the parent's bucket and load image from the fork
       try {
-        const response = await fetch("/api/agent");
+        const params = new URLSearchParams();
+        if (parent.bucketName) params.set('bucketName', parent.bucketName);
+        if (parent.fileName) params.set('fileName', parent.fileName);
+        const response = await fetch(`/api/fork?${params.toString()}`);
 
         if (!response.ok) {
           console.error("Failed to fetch image from agent API");
@@ -259,12 +286,14 @@ function InfiniteCanvas() {
 
         const blob = await response.blob();
         const objectUrl = URL.createObjectURL(blob);
+        const bucketName = response.headers.get('x-bucket-name') || undefined;
+        const fileName = response.headers.get('x-file-name') || undefined;
 
         // Update the item with the loaded image
         setItems((prev) =>
           prev.map((item) =>
             item.id === childId
-              ? { ...item, imageUrl: objectUrl, isLoading: false }
+              ? { ...item, imageUrl: objectUrl, isLoading: false, bucketName, fileName }
               : item
           )
         );
@@ -272,7 +301,7 @@ function InfiniteCanvas() {
         console.error("Error loading image:", error);
       }
     },
-    [],
+    [forkOnAdd],
   );
 
   useEffect(() => {
@@ -319,12 +348,15 @@ function InfiniteCanvas() {
 
         const blob = await response.blob();
         const objectUrl = URL.createObjectURL(blob);
+        // Seed origin item metadata so children know where to fork from
+        const originBucket = 'bucket-with-snapshots';
+        const originFile = 'original_image.png';
 
         // Update the origin item with the loaded image
         setItems((prev) =>
           prev.map((item) =>
             item.id === originId
-              ? { ...item, imageUrl: objectUrl, isLoading: false }
+              ? { ...item, imageUrl: objectUrl, isLoading: false, bucketName: originBucket, fileName: originFile }
               : item
           )
         );
@@ -348,6 +380,66 @@ function InfiniteCanvas() {
     },
     [createChildItem, items],
   );
+
+  const handleRefresh = useCallback(async (id: string) => {
+    const item = items.find((i) => i.id === id);
+    if (!item?.bucketName || !item?.fileName) return;
+
+    // Trigger generation to replace the main file in this forked bucket
+    try {
+      // mark generating
+      setItems((prev) => prev.map((it) => it.id === id ? { ...it, isGenerating: true } : it));
+      // Always save as canonical original file name then refetch it
+      const canonicalFile = 'original_image.png';
+      const params = new URLSearchParams({ bucketName: item.bucketName, fileName: item.fileName, targetFileName: canonicalFile });
+      const response = await fetch(`/api/generate?${params.toString()}`, { method: 'POST' });
+      if (!response.ok) {
+        console.error('Failed to generate image for bucket', item.bucketName);
+        return;
+      }
+      const refetchParams = new URLSearchParams({ bucketName: item.bucketName, fileName: canonicalFile });
+      const refetch = await fetch(`/api/get-file?${refetchParams.toString()}`);
+      if (!refetch.ok) {
+        console.error('Failed to refetch saved image for', item.bucketName, item.fileName);
+        return;
+      }
+      const blob = await refetch.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const newBucket = refetch.headers.get('x-bucket-name') || item.bucketName;
+      const newFile = refetch.headers.get('x-file-name') || canonicalFile;
+      setItems((prev) => {
+        // If forking is disabled, unify ALL items to the same original file
+        if (!forkOnAdd) {
+          return prev.map((it) => ({ ...it, imageUrl: objectUrl, bucketName: newBucket, fileName: newFile }));
+        }
+        // Otherwise only update items that reference this file
+        return prev.map((it) => (it.bucketName === item.bucketName && it.fileName === item.fileName)
+          ? { ...it, imageUrl: objectUrl, bucketName: newBucket, fileName: newFile }
+          : it);
+      });
+      setListVersion((v) => v + 1);
+    } catch (e) {
+      console.error('Error generating image:', e);
+    }
+    finally {
+      // clear generating
+      setItems((prev) => prev.map((it) => it.id === id ? { ...it, isGenerating: false } : it));
+    }
+  }, [items, forkOnAdd]);
+
+  const handleRefreshAll = useCallback(async () => {
+    // Trigger one generation per unique bucket/file pair, in parallel
+    const seen = new Set<string>();
+    const idsToRefresh: string[] = [];
+    for (const it of items) {
+      if (!it.bucketName || !it.fileName) continue;
+      const key = `${it.bucketName}::${it.fileName}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      idsToRefresh.push(it.id);
+    }
+    await Promise.all(idsToRefresh.map((id) => handleRefresh(id)));
+  }, [items, handleRefresh]);
 
   const renderedConnections = useMemo(() => {
     const idToItem = new Map(items.map((item) => [item.id, item]));
@@ -393,6 +485,35 @@ function InfiniteCanvas() {
       onPointerCancel={endPan}
       onWheel={handleWheel}
     >
+      <div className="absolute top-4 right-4 z-50 flex items-center gap-3 bg-white/80 dark:bg-black/50 backdrop-blur px-3 py-2 rounded-md border border-black/10 shadow-sm" onPointerDown={(e) => e.stopPropagation()}>
+        <span className="text-xs font-medium">Fork on add</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={forkOnAdd}
+          aria-label="Toggle fork on add"
+          onClick={() => setForkOnAdd((v) => !v)}
+          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${forkOnAdd ? 'bg-blue-600' : 'bg-gray-300'}`}
+        >
+          <span
+            className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${forkOnAdd ? 'translate-x-5' : 'translate-x-1'}`}
+          />
+        </button>
+        <button
+          type="button"
+          onClick={handleRefreshAll}
+          disabled={anyGenerating}
+          className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md border border-blue-600/20 bg-blue-600 text-white hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+          aria-label="Generate all items"
+          title="Generate all items"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-4 w-4">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <polyline points="21 3 21 9 15 9" />
+          </svg>
+          Generate all
+        </button>
+      </div>
       <div className="canvas-layer">
         <div className="canvas-surface canvas-grid" style={gridStyle} />
         <div className="canvas-surface canvas-content" style={contentStyle}>
@@ -406,6 +527,11 @@ function InfiniteCanvas() {
               position={item.position}
               onClick={handleItemClick}
               isLoading={item.isLoading}
+              onRefresh={handleRefresh}
+              bucketName={item.bucketName}
+              isGenerating={item.isGenerating}
+              // bump prop reference when version changes to force re-render
+              version={listVersion}
             />
           ))}
         </div>

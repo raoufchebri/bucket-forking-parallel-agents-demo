@@ -6,7 +6,7 @@ export async function GET() {
     // Fetch the original_image.png file from ogbucket
     const result = await get('original_image.png', 'file', {
       config: {
-        bucket: 'ogbucket',
+        bucket: 'bucket-with-snapshots',
       },
     });
     
