@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 import { get } from "@tigrisdata/storage";
 
 export async function GET(req: NextRequest) {
@@ -26,7 +28,9 @@ export async function GET(req: NextRequest) {
     return new NextResponse(buffer, {
       headers: {
         "content-type": contentType,
-        "cache-control": "no-store",
+        "cache-control": "no-store, no-cache, must-revalidate",
+        "pragma": "no-cache",
+        "expires": "0",
         "x-bucket-name": bucketName,
         "x-file-name": fileName,
       },

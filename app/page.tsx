@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { nanoid } from "nanoid";
 
-import { Item } from "./components/Item";
+import { Bucket } from "./components/Bucket";
+import { Agent } from "./components/Agent";
 
 const MIN_SCALE = 0.25;
 const MAX_SCALE = 4;
@@ -26,10 +27,11 @@ type CanvasState = {
 
 type CanvasItem = {
   id: string;
+  kind: 'bucket' | 'agent';
   label: string;
   imageUrl?: string;
   position: Point;
-  parentId?: string;
+  parentId?: string; // agent -> bucket
   isLoading?: boolean;
   bucketName?: string;
   fileName?: string;
@@ -188,83 +190,82 @@ function InfiniteCanvas() {
     };
   }, [state]);
 
-  const createChildItem = useCallback(
-    async (parent: CanvasItem) => {
-      const childId = nanoid();
-      const child: CanvasItem = {
-        id: childId,
-        label: "Item",
-        position: parent.position,
-        parentId: parent.id,
-        isLoading: true,
-      };
-
-      // Create the item with loading state immediately
-      setItems((prev) => {
-        const siblings = prev.filter((item) => item.parentId === parent.id);
-        const updatedSiblings = [...siblings, child];
-
-        const startY =
-          parent.position.y - ((updatedSiblings.length - 1) * CHILD_VERTICAL_GAP) / 2;
-
-        const positionedChildren = updatedSiblings.map((sibling, index) => ({
-          id: sibling.id,
-          position: {
-            x: parent.position.x + CHILD_OFFSET_X,
-            y: startY + index * CHILD_VERTICAL_GAP,
-          },
-        }));
-
-        const positionMap = new Map<string, Point>();
-        positionedChildren.forEach(({ id, position }) => {
-          positionMap.set(id, position);
-        });
-
-        const nextItems = prev.map((item) => {
-          if (item.parentId !== parent.id) {
-            return item;
-          }
-
-          const nextPosition = positionMap.get(item.id);
-
-          if (!nextPosition) {
-            return item;
-          }
-
-          return {
-            ...item,
-            position: nextPosition,
-          };
-        });
-
-        const newChildPosition = positionMap.get(child.id);
-
-        if (newChildPosition) {
-          nextItems.push({
-            ...child,
-            position: newChildPosition,
-          });
-        }
-
-        return nextItems;
-      });
-
-      setConnections((prev) => [
-        ...prev,
-        { id: nanoid(), from: parent.id, to: childId },
-      ]);
-
-      // If forking is disabled, just clone parent's image/metadata
+  const addAgent = useCallback(
+    async (bucket: CanvasItem) => {
+      // Fork off disabled: create an agent attached to this bucket
       if (!forkOnAdd) {
+        const agentId = nanoid();
+        const draftAgent: CanvasItem = {
+          id: agentId,
+          kind: 'agent',
+          label: "Agent",
+          position: bucket.position,
+          parentId: bucket.id,
+          isLoading: true,
+        };
+
+        setItems((prev) => {
+          const siblingAgents = prev.filter((item) => item.parentId === bucket.id && item.kind === 'agent');
+          const updatedSiblings = [...siblingAgents, draftAgent];
+
+          const startY = bucket.position.y - ((updatedSiblings.length - 1) * CHILD_VERTICAL_GAP) / 2;
+
+          const positionedChildren = updatedSiblings.map((sibling, index) => ({
+            id: sibling.id,
+            position: {
+              x: bucket.position.x + CHILD_OFFSET_X,
+              y: startY + index * CHILD_VERTICAL_GAP,
+            },
+          }));
+
+          const positionMap = new Map<string, Point>();
+          positionedChildren.forEach(({ id, position }) => {
+            positionMap.set(id, position);
+          });
+
+          const nextItems = prev.map((item) => {
+            if (item.parentId !== bucket.id || item.kind !== 'agent') {
+              return item;
+            }
+
+            const nextPosition = positionMap.get(item.id);
+
+            if (!nextPosition) {
+              return item;
+            }
+
+            return {
+              ...item,
+              position: nextPosition,
+            };
+          });
+
+          const newChildPosition = positionMap.get(agentId);
+
+          if (newChildPosition) {
+            nextItems.push({
+              ...draftAgent,
+              position: newChildPosition,
+            });
+          }
+
+          return nextItems;
+        });
+
+        setConnections((prev) => [
+          ...prev,
+          { id: nanoid(), from: bucket.id, to: agentId },
+        ]);
+
         setItems((prev) =>
           prev.map((item) =>
-            item.id === childId
+            item.id === agentId
               ? {
                   ...item,
-                  imageUrl: parent.imageUrl,
+                  imageUrl: undefined,
                   isLoading: false,
-                  bucketName: parent.bucketName,
-                  fileName: parent.fileName,
+                  bucketName: bucket.bucketName,
+                  fileName: bucket.fileName,
                 }
               : item,
           ),
@@ -272,33 +273,90 @@ function InfiniteCanvas() {
         return;
       }
 
-      // Fork the parent's bucket and load image from the fork
+      // Fork-on-add: create a visual forked bucket and an agent connected to it
       try {
+        // Show spinner on the clicked bucket only (avoid flashing siblings)
+        setItems((prev) => prev.map((it) => it.id === bucket.id ? { ...it, isLoading: true } : it));
+
         const params = new URLSearchParams();
-        if (parent.bucketName) params.set('bucketName', parent.bucketName);
-        if (parent.fileName) params.set('fileName', parent.fileName);
+        if (bucket.bucketName) params.set('bucketName', bucket.bucketName);
+        if (bucket.fileName) params.set('fileName', bucket.fileName);
         const response = await fetch(`/api/fork?${params.toString()}`);
 
         if (!response.ok) {
-          console.error("Failed to fetch image from agent API");
+          console.error("Failed to fetch image from fork API");
+          // clear spinner
+          setItems((prev) => prev.map((it) => it.id === bucket.id ? { ...it, isLoading: false } : it));
           return;
         }
 
         const blob = await response.blob();
-        const objectUrl = URL.createObjectURL(blob);
-        const bucketName = response.headers.get('x-bucket-name') || undefined;
-        const fileName = response.headers.get('x-file-name') || undefined;
+        const forkObjectUrl = URL.createObjectURL(blob);
+        const forkBucketName = response.headers.get('x-bucket-name') || undefined;
+        const forkFileName = response.headers.get('x-file-name') || undefined;
 
-        // Update the item with the loaded image
-        setItems((prev) =>
-          prev.map((item) =>
-            item.id === childId
-              ? { ...item, imageUrl: objectUrl, isLoading: false, bucketName, fileName }
-              : item
-          )
-        );
+        const forkBucketId = nanoid();
+        const childAgentId = nanoid();
+
+        // Compute layout: keep forks evenly spaced; place child fork to the right of bucket.
+        setItems((prev) => {
+          const siblingForks = prev.filter((it) => it.parentId === bucket.id && it.kind === 'bucket');
+          // Determine X column for forks: for top-level use +1, for deeper levels use +2 to avoid overlapping existing agents
+          const forkColumnX = bucket.parentId ? bucket.position.x + 2 * CHILD_OFFSET_X : bucket.position.x + CHILD_OFFSET_X;
+          const allForks = [...siblingForks, { id: forkBucketId } as any];
+          const startY = bucket.position.y - ((allForks.length - 1) * CHILD_VERTICAL_GAP) / 2;
+          const positionedForks = allForks.map((s, i) => ({ id: (s as any).id, position: { x: forkColumnX, y: startY + i * CHILD_VERTICAL_GAP } }));
+          const forkPosMap = new Map<string, Point>();
+          positionedForks.forEach(({ id, position }) => forkPosMap.set(id, position));
+
+          const next = prev.map((it) => {
+            // reposition existing forks under this bucket
+            if (it.parentId === bucket.id && it.kind === 'bucket') {
+              const np = forkPosMap.get(it.id);
+              return np ? { ...it, position: np } : it;
+            }
+            // keep their agents aligned horizontally
+            if (it.kind === 'agent' && it.parentId && forkPosMap.has(it.parentId)) {
+              const fpos = forkPosMap.get(it.parentId)!;
+              return { ...it, position: { x: fpos.x + CHILD_OFFSET_X, y: fpos.y } };
+            }
+            return it;
+          });
+
+          const newForkPos = forkPosMap.get(forkBucketId)!;
+          // Add new fork bucket (ready state) and its agent
+          next.push({
+            id: forkBucketId,
+            kind: 'bucket',
+            label: 'Bucket',
+            position: newForkPos,
+            parentId: bucket.id,
+            isLoading: false,
+            imageUrl: forkObjectUrl,
+            bucketName: forkBucketName,
+            fileName: forkFileName,
+          });
+
+          next.push({
+            id: childAgentId,
+            kind: 'agent',
+            label: 'Agent',
+            position: { x: newForkPos.x + CHILD_OFFSET_X, y: newForkPos.y },
+            parentId: forkBucketId,
+            isLoading: false,
+            bucketName: forkBucketName,
+            fileName: forkFileName,
+          });
+
+          return next.map((it) => (it.id === bucket.id ? { ...it, isLoading: false } : it));
+        });
+
+        // Add connections
+        setConnections((prev) => [...prev, { id: nanoid(), from: bucket.id, to: forkBucketId }, { id: nanoid(), from: forkBucketId, to: childAgentId }]);
       } catch (error) {
         console.error("Error loading image:", error);
+        // clear spinner
+        setItems((prev) => prev.map((it) => it.id === bucket.id ? { ...it, isLoading: false } : it));
       }
     },
     [forkOnAdd],
@@ -323,15 +381,16 @@ function InfiniteCanvas() {
     isInitialisedRef.current = true;
   }, []);
 
-  // Load the origin image from the API
+  // Load the origin bucket image from the API
   useEffect(() => {
     const originId = nanoid();
     
-    // Create the origin item with loading state immediately
+    // Create the origin bucket with loading state immediately
     setItems([
       {
         id: originId,
-        label: "Origin",
+        kind: 'bucket',
+        label: "Bucket",
         position: { x: 0, y: 0 },
         isLoading: true,
       },
@@ -348,11 +407,11 @@ function InfiniteCanvas() {
 
         const blob = await response.blob();
         const objectUrl = URL.createObjectURL(blob);
-        // Seed origin item metadata so children know where to fork from
+        // Seed origin bucket metadata so agents know where to generate into
         const originBucket = 'bucket-with-snapshots';
         const originFile = 'original_image.png';
 
-        // Update the origin item with the loaded image
+        // Update the origin bucket with the loaded image
         setItems((prev) =>
           prev.map((item) =>
             item.id === originId
@@ -368,54 +427,72 @@ function InfiniteCanvas() {
     loadOriginImage();
   }, []);
 
-  const handleItemClick = useCallback(
-    (id: string) => {
-      const parent = items.find((item) => item.id === id);
+  const handleAddAgent = useCallback(() => {
+    const bucket = items.find((i) => i.kind === 'bucket');
+    if (!bucket) return;
+    addAgent(bucket);
+  }, [items, addAgent]);
 
-      if (!parent) {
-        return;
-      }
-
-      createChildItem(parent);
-    },
-    [createChildItem, items],
-  );
-
-  const handleRefresh = useCallback(async (id: string) => {
-    const item = items.find((i) => i.id === id);
+  const handleAgentGenerate = useCallback(async (id: string) => {
+    const item = items.find((i) => i.id === id && i.kind === 'agent');
     if (!item?.bucketName || !item?.fileName) return;
 
     // Trigger generation to replace the main file in this forked bucket
     try {
       // mark generating
       setItems((prev) => prev.map((it) => it.id === id ? { ...it, isGenerating: true } : it));
-      // Always save as canonical original file name then refetch it
+      // Save agent output to a unique per-agent path and also update canonical for the bucket
       const canonicalFile = 'original_image.png';
-      const params = new URLSearchParams({ bucketName: item.bucketName, fileName: item.fileName, targetFileName: canonicalFile });
+      const agentTarget = `agents/${id}.png`;
+      const params = new URLSearchParams({ bucketName: item.bucketName, fileName: item.fileName, targetFileName: agentTarget });
       const response = await fetch(`/api/generate?${params.toString()}`, { method: 'POST' });
       if (!response.ok) {
         console.error('Failed to generate image for bucket', item.bucketName);
         return;
       }
-      const refetchParams = new URLSearchParams({ bucketName: item.bucketName, fileName: canonicalFile });
-      const refetch = await fetch(`/api/get-file?${refetchParams.toString()}`);
-      if (!refetch.ok) {
-        console.error('Failed to refetch saved image for', item.bucketName, item.fileName);
+      // Refetch agent-specific file (what the agent displays)
+      const agentRefetchParams = new URLSearchParams({ bucketName: item.bucketName, fileName: agentTarget });
+      const agentRefetch = await fetch(`/api/get-file?${agentRefetchParams.toString()}`);
+      if (!agentRefetch.ok) {
+        console.error('Failed to refetch agent image for', item.bucketName, agentTarget);
         return;
       }
-      const blob = await refetch.blob();
-      const objectUrl = URL.createObjectURL(blob);
-      const newBucket = refetch.headers.get('x-bucket-name') || item.bucketName;
-      const newFile = refetch.headers.get('x-file-name') || canonicalFile;
+      const agentBlob = await agentRefetch.blob();
+      const agentObjectUrl = URL.createObjectURL(agentBlob);
+      // Refetch canonical bucket image to update bucket view
+      const bucketRefetchParams = new URLSearchParams({ bucketName: item.bucketName, fileName: canonicalFile });
+      const bucketRefetch = await fetch(`/api/get-file?${bucketRefetchParams.toString()}`);
+      if (!bucketRefetch.ok) {
+        console.error('Failed to refetch saved image for bucket', item.bucketName, canonicalFile);
+        return;
+      }
+      const bucketBlob = await bucketRefetch.blob();
+      const bucketObjectUrl = URL.createObjectURL(bucketBlob);
+      const bucketName = bucketRefetch.headers.get('x-bucket-name') || item.bucketName;
+      const bucketFile = bucketRefetch.headers.get('x-file-name') || canonicalFile;
       setItems((prev) => {
-        // If forking is disabled, unify ALL items to the same original file
         if (!forkOnAdd) {
-          return prev.map((it) => ({ ...it, imageUrl: objectUrl, bucketName: newBucket, fileName: newFile }));
+          // Update only the generating agent (with its own file) and the single bucket (with canonical)
+          return prev.map((it) => {
+            if (it.id === id) {
+              return { ...it, imageUrl: agentObjectUrl, bucketName: item.bucketName, fileName: agentTarget };
+            }
+            if (it.kind === 'bucket') {
+              return { ...it, imageUrl: bucketObjectUrl, bucketName, fileName: bucketFile };
+            }
+            return it;
+          });
         }
-        // Otherwise only update items that reference this file
-        return prev.map((it) => (it.bucketName === item.bucketName && it.fileName === item.fileName)
-          ? { ...it, imageUrl: objectUrl, bucketName: newBucket, fileName: newFile }
-          : it);
+        // Fork-on-add: update this agent's image and its connected bucket's canonical image
+        return prev.map((it) => {
+          if (it.id === id) {
+            return { ...it, imageUrl: agentObjectUrl, bucketName: item.bucketName, fileName: agentTarget };
+          }
+          if (it.id === item.parentId && it.kind === 'bucket') {
+            return { ...it, imageUrl: bucketObjectUrl, bucketName, fileName: bucketFile };
+          }
+          return it;
+        });
       });
       setListVersion((v) => v + 1);
     } catch (e) {
@@ -427,19 +504,10 @@ function InfiniteCanvas() {
     }
   }, [items, forkOnAdd]);
 
-  const handleRefreshAll = useCallback(async () => {
-    // Trigger one generation per unique bucket/file pair, in parallel
-    const seen = new Set<string>();
-    const idsToRefresh: string[] = [];
-    for (const it of items) {
-      if (!it.bucketName || !it.fileName) continue;
-      const key = `${it.bucketName}::${it.fileName}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      idsToRefresh.push(it.id);
-    }
-    await Promise.all(idsToRefresh.map((id) => handleRefresh(id)));
-  }, [items, handleRefresh]);
+  const handleGenerateAll = useCallback(async () => {
+    const agentIds = items.filter((i) => i.kind === 'agent' && i.bucketName && i.fileName).map((i) => i.id);
+    await Promise.all(agentIds.map((id) => handleAgentGenerate(id)));
+  }, [items, handleAgentGenerate]);
 
   const renderedConnections = useMemo(() => {
     const idToItem = new Map(items.map((item) => [item.id, item]));
@@ -501,7 +569,16 @@ function InfiniteCanvas() {
         </button>
         <button
           type="button"
-          onClick={handleRefreshAll}
+          onClick={handleAddAgent}
+          className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md border border-gray-600/20 bg-gray-800 text-white hover:bg-gray-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+          aria-label="Add agent"
+          title="Add agent"
+        >
+          + Add Agent
+        </button>
+        <button
+          type="button"
+          onClick={handleGenerateAll}
           disabled={anyGenerating}
           className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md border border-blue-600/20 bg-blue-600 text-white hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
           aria-label="Generate all items"
@@ -519,20 +596,32 @@ function InfiniteCanvas() {
         <div className="canvas-surface canvas-content" style={contentStyle}>
           {renderedConnections}
           {items.map((item) => (
-            <Item
-              key={item.id}
-              id={item.id}
-              label={item.label}
-              imageUrl={item.imageUrl}
-              position={item.position}
-              onClick={handleItemClick}
-              isLoading={item.isLoading}
-              onRefresh={handleRefresh}
-              bucketName={item.bucketName}
-              isGenerating={item.isGenerating}
-              // bump prop reference when version changes to force re-render
-              version={listVersion}
-            />
+            item.kind === 'bucket' ? (
+              <Bucket
+                key={item.id}
+                id={item.id}
+                label={item.label}
+                imageUrl={item.imageUrl}
+                position={item.position}
+                isLoading={item.isLoading}
+                bucketName={item.bucketName}
+                fileName={item.fileName}
+                version={listVersion}
+                onClick={() => addAgent(item)}
+              />
+            ) : (
+              <Agent
+                key={item.id}
+                id={item.id}
+                label={item.label}
+                imageUrl={item.imageUrl}
+                position={item.position}
+                isLoading={item.isLoading}
+                isGenerating={item.isGenerating}
+                onGenerate={handleAgentGenerate}
+                version={listVersion}
+              />
+            )
           ))}
         </div>
       </div>

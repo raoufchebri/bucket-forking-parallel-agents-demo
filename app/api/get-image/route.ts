@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 import { get } from '@tigrisdata/storage';
 
 export async function GET() {
@@ -30,7 +32,9 @@ export async function GET() {
     return new NextResponse(buffer, {
       headers: {
         "content-type": result.data.type || "image/png",
-        "cache-control": "public, max-age=3600",
+        "cache-control": "no-store, no-cache, must-revalidate",
+        "pragma": "no-cache",
+        "expires": "0",
         "content-length": buffer.length.toString(),
       },
     });
